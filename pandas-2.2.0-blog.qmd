@@ -1,0 +1,217 @@
+---
+title: "How to use pandas `case_when()`"
+subtitle: "And other new features in pandas 2.2.0"
+Author: "Michael Walshe"
+format:
+  html:
+    df-print: kable
+    mainfont: Arial
+    embed-resources: true
+  docx:
+    reference-doc: kd-quarto-ref-doc.docx
+    df-print: default
+    fig-align: center
+  gfm: default
+---
+
+Pandas is the most popular Python package for data manipulation and analysis, providing a high-level tool for flexible manipulation of data in a tabular format. It just released version 2.2.0, the second minor release in the 2.0 series, and likely the last minor release before pandas 3.0 is scheduled to arrive in April!
+
+Included are several new features, bug fixes, deprecations, and performance enhancements. I'm going to demonstrate a few of the most notable changes, however for a full overview please see the [release notes](https://pandas.pydata.org/docs/whatsnew/v2.2.0.html).
+
+
+
+# A new Series method: `Series.case_when`
+
+## Overview
+
+The first new feature is a new method for a Series, that allows you to replace values based on a set of conditions. This is the most exciting change in 2.2.0 for me, as it's something that I and the community have been requesting for a long time (see various StackOverflow posts with over 2m collective views at [1]((https://stackoverflow.com/questions/49228596/pandas-case-when-default-in-pandas)), [2](https://stackoverflow.com/questions/26886653/create-new-column-based-on-values-from-other-columns-apply-a-function-of-multi), and [3](https://stackoverflow.com/questions/19913659/how-do-i-create-a-new-column-where-the-values-are-selected-based-on-existing-col)). 
+
+
+Previously, there were several different ways to conditionally create or alter columns in pandas: [`np.select`](https://numpy.org/doc/stable/reference/generated/numpy.select.html), [`np.where`](https://numpy.org/doc/stable/reference/generated/numpy.where.html), [`Series.where`](https://pandas.pydata.org/docs/reference/api/pandas.Series.where.html), [`Series.mask`](https://pandas.pydata.org/docs/reference/api/pandas.Series.mask.html), and of course [`<Series/DataFrame>.loc`](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.loc.html). All of these have their place, but for the use-case of checking a *series* of conditions and returning values they all had problems, from readability to requiring you to use functionality outside of pandas. A new pandas function that cleanly solves this common problem in data wrangling has been long overdue!
+
+## Example
+
+Let's create an example dataframe:
+
+```{python}
+import numpy as np
+import pandas as pd
+
+np.random.seed(42)
+
+df = pd.DataFrame(
+    {
+        "A": np.random.choice(list("ABC"), 50),
+        "B": np.random.choice(list("XYZ"), 50),
+        "C": np.random.random(50)*2 - 1,
+        "D": pd.date_range("2020-01-01", periods=50, freq="D"),
+    }
+)
+
+df.head()
+```
+
+<br>
+
+Now we can create a new column in that dataframe based on an existing column using `case_when`:
+
+```{python}
+# The only argument to case_when is a list of tuples
+# of the form: (condition, value)
+df["E"] = df["A"].case_when(
+    [
+        (df["A"] == "A", "A is A"),
+        (df["B"] == "X", "B is X"),
+    ]
+)
+
+df[["A", "B", "E"]].head()
+```
+
+<br>
+
+Note two important things:
+
+- The conditions are applied such that if a condition is `True`, then the remaining conditions are **ignored** (*Note: this isn't how it's implemented, so there are no performance improvements from  "short-circuiting"*)
+- The default values used (for when no conditions match) are the values from the original `Series`
+
+We can also use `Callables` (a function) for the conditions or replacements, these will be passed the Series that `case_when` is called on as an argument, for example:
+
+```{python}
+df["E"] = df["A"].case_when(
+    [
+        (df["D"].dt.is_month_start, lambda s: s + ": At month start"),
+        (lambda s: s == "A", df["A"] + "A")
+    ]
+)
+
+df[["A", "D", "E"]].head()
+```
+
+<br>
+
+As a final handy trick, if you want to use your own default value, you can either create a new constant Series to use as the input, or have a final condition in your `caselist` argument that is always true:
+
+- Method 1:
+```{python}
+df["E"] = pd.Series(np.nan, index=df.index).case_when(
+    [
+        (df["A"] == "A", 0),
+        (df["C"] < 0.25, -df["C"]),
+    ]
+)
+
+df[["E"]].head()
+```
+
+<br>
+
+- Method 2:
+
+```{python}
+df["E"] = df["C"].case_when(
+    [
+        (df["A"] == "A", 0),
+        (df["C"] < 0.25, -df["C"]),
+        (pd.Series(True), np.nan)
+    ]
+)
+
+df[["E"]].head()
+```
+
+<br>
+
+# More performant database drivers with ADBC
+
+## Overview
+
+Pandas now supports [Arrow ADBC drivers](https://arrow.apache.org/adbc/current/index.html) when reading from or writing to a database. This leads to much better performance, better type handling, and is part of the general move to a pandas backed by Arrow as well as NumPy.
+
+## Example
+
+Here I'll connect to a local SQLite database with SQLAlchemy, and using the ADBC drivers. As we'll see, using these (not very scientific) benchmarks we get a huge performance improvement!
+
+```{python}
+import timeit
+
+import adbc_driver_sqlite.dbapi
+import sqlalchemy as sa
+
+engine = sa.create_engine("sqlite:///temp.db")
+
+with (
+    engine.connect() as conn1,
+    adbc_driver_sqlite.dbapi.connect("temp.db") as conn2,
+):
+    df = pd.DataFrame(
+        np.random.randint(10_000, size=(100_000, 10)), columns=list("abcdefghij")
+    )
+
+    print(
+        "Writing using the default driver: ",
+        timeit.timeit(lambda: df.to_sql("TEST", conn1, if_exists="replace"), number=10),
+    )
+    print(
+        "Writing using ADBC: ",
+        timeit.timeit(lambda: df.to_sql("TEST", conn2, if_exists="replace"), number=10),
+    )
+    print(
+        "Reading using the default driver: ",
+        timeit.timeit(lambda: pd.read_sql("TEST", conn1), number=10),
+    )
+    print(
+        "Reading using ADBC: ",
+        timeit.timeit(lambda: pd.read_sql("TEST", conn2), number=10),
+    )
+```
+
+<br>
+
+# Improved Functionality for Processing Structured Columns
+
+## Overview
+
+The final new feature I'll mention is again part of the move to an Arrow backed pandas. There is now more functionality and support for nested PyArrow data, with the `struct` and `list` Series accessors. This makes working with columns that contain structured data (such as list columns or custom structures) much easier. There are only a few methods at the moment, but this could be the start of array & struct columns as first class citizens in pandas.
+
+## Example
+
+Often, you may receive structured data via JSON, such as the below:
+```{python}
+from io import StringIO
+import pyarrow as pa
+
+raw_data = StringIO(
+    """
+    [
+        {"A": [1, 2, 3],},
+        {"A": [4, 5]},
+        {"A": [6]}
+    ]
+    """
+)
+
+df = pd.read_json(
+    raw_data,
+    dtype=pd.ArrowDtype(pa.list_(pa.int64())),
+)
+
+df.head()
+```
+
+<br>
+
+We can now use built-in pandas methods to interact with these PyArrow structures:
+
+- List Accessors:
+```{python}
+df["A"].list[0]
+```
+
+- List Functions:
+
+```{python}
+df["A"].list.flatten()
+```
+
+That's all for today, but check back in for our blog going over the key features and what to watch out for in pandas 3.0 when it lands!
